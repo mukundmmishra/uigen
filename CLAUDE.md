@@ -5,90 +5,82 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Commands
 
 ```bash
-# Install dependencies, generate Prisma client, run migrations
-npm run setup
-
-# Start dev server (Turbopack)
-npm run dev
-
-# Build for production
-npm run build
-
-# Run all tests
-npm test
-
-# Run a single test file
-npx vitest run src/lib/__tests__/file-system.test.ts
-
-# Reset database (destructive)
-npm run db:reset
-
-# Re-generate Prisma client after schema changes
-npx prisma generate
-
-# Run a new migration
-npx prisma migrate dev --name <migration-name>
+npm run setup          # install deps, generate Prisma client, run migrations
+npm run dev            # start dev server (Turbopack)
+npm run build          # production build
+npm test               # run all tests (watch mode)
+npx vitest run         # run tests once
+npx vitest run src/lib/__tests__/file-system.test.ts  # single test file
+npm run db:reset       # reset database (destructive — confirm first)
+npx prisma generate    # re-generate client after schema changes
+npx prisma migrate dev --name <migration-name>        # new migration
 ```
 
 ## Environment Variables
 
 | Variable | Required | Notes |
 |----------|----------|-------|
-| `ANTHROPIC_API_KEY` | No | Without it, a `MockLanguageModel` is used (hardcoded demo responses) |
+| `ANTHROPIC_API_KEY` | No | Without it, `MockLanguageModel` is used (hardcoded demo responses) |
 | `JWT_SECRET` | No | Falls back to `"development-secret-key"` in dev |
 
-Database is SQLite at `prisma/dev.db`. Prisma client is generated to `src/generated/prisma/`.
+Database: SQLite at `prisma/dev.db`. Prisma client generated to `src/generated/prisma/`.
+
+## Coding Standards
+
+- TypeScript strict mode — no `any`, prefer explicit return types on exported functions
+- Use `@/` path alias for all imports (never relative `../../../`)
+- React components: named exports only, no default exports
+- Server-only modules must import `server-only` at the top
+- Vitest test files that call server-only code require `// @vitest-environment node` at line 1
+
+## Rules
+
+- **NEVER** run `npm audit fix --force` without explicit user approval
+- **NEVER** run `db:reset` without confirming with the user — it drops all data
+- **Do NOT** add `h-full` to the inner wrapper `<div>` inside Radix `ScrollArea` — it breaks height propagation; render empty states outside `ScrollArea` instead
+- **Do NOT** use Unix-style `NODE_OPTIONS='...'` in npm scripts — use `cross-env` for Windows compatibility
+
+## Workflow
+
+- After editing `prisma/schema.prisma`, run `npx prisma generate` then create a migration
+- After pulling changes that include schema updates, run `npm run setup`
+- `node-compat.cjs` is loaded via `NODE_OPTIONS` in all scripts — required for Node 25+ SSR compatibility (deletes `globalThis.localStorage`/`sessionStorage`)
 
 ## Architecture
 
-UIGen is an AI-powered React component generator. Users describe components in a chat; the AI writes code into a client-side virtual file system; results are previewed live in a sandboxed iframe.
+UIGen is an AI-powered React component generator. Users describe components in chat; the AI writes code into a client-side virtual file system; results preview live in a sandboxed iframe.
 
 ### Request / Data Flow
 
-1. User types in `MessageInput` → `ChatContext` (wraps Vercel AI SDK `useChat`) sends `POST /api/chat` with `{ messages, files: vfs.serialize(), projectId }`
+1. `MessageInput` → `ChatContext` sends `POST /api/chat` with `{ messages, files: vfs.serialize(), projectId }`
 2. `/api/chat/route.ts` reconstructs the VFS, calls `streamText()` with `claude-haiku-4-5` and two tools
-3. AI calls tools (`str_replace_editor`, `file_manager`) to mutate files; each tool call streams back to the client
-4. `FileSystemContext.handleToolCall()` applies mutations to the client-side VFS and increments `refreshTrigger`
-5. `PreviewFrame` detects the trigger, transpiles all VFS files with `@babel/standalone`, builds an import map (local files → `blob:` URLs, third-party → `esm.sh`), and sets the result as `srcdoc` on a sandboxed iframe
-6. On finish, if authenticated, messages + VFS state are persisted to the `Project` row in SQLite
+3. AI calls tools (`str_replace_editor`, `file_manager`) to mutate files; each streams back to the client
+4. `FileSystemContext.handleToolCall()` applies mutations to the VFS and increments `refreshTrigger`
+5. `PreviewFrame` transpiles VFS files with `@babel/standalone`, builds an import map (`blob:` URLs for local, `esm.sh` for third-party), sets result as `srcdoc` on a sandboxed iframe
+6. On finish, if authenticated, messages + VFS state persist to the `Project` row in SQLite
 
 ### Key Abstractions
 
-**`VirtualFileSystem`** (`src/lib/file-system.ts`) — In-memory file tree as a `Map<string, FileNode>`. Never writes to disk for generated components. `serialize()` / `deserializeFromNodes()` convert to/from JSON for persistence and API transport.
-
-**`FileSystemContext`** (`src/lib/contexts/file-system-context.tsx`) — React context that owns the VFS instance and exposes `handleToolCall()`. Initialized from `project.data` on page load.
-
-**`ChatContext`** (`src/lib/contexts/chat-context.tsx`) — Wraps `useChat`, injects VFS state into every request, and routes tool call responses to `FileSystemContext`.
-
-**AI Tools** — Two tools registered server-side with `streamText`:
-- `str_replace_editor` (`src/lib/tools/str-replace.ts`): `view`, `create`, `str_replace`, `insert`
-- `file_manager` (`src/lib/tools/file-manager.ts`): `rename`, `delete`
-
-**Preview Pipeline** (`src/lib/transform/jsx-transformer.ts`) — Babel-in-browser JSX transform + import map. Entry point is `/App.jsx`. CSS files become `<style>` blocks. Tailwind is loaded from CDN.
-
-**Auth** (`src/lib/auth.ts`) — Custom JWT (`HS256`, 7-day expiry) stored in an `httpOnly` cookie `auth-token`. No third-party auth library. Middleware protects `/api/projects` and `/api/filesystem`; `/api/chat` checks auth only for the DB-persist step.
-
-**Anonymous Work Tracking** (`src/lib/anon-work-tracker.ts`) — Buffers unauthenticated messages + VFS in `sessionStorage`. On sign-in/sign-up the buffer is saved as a new project and the user is redirected to it.
-
-**`MockLanguageModel`** (`src/lib/provider.ts`) — Activated when `ANTHROPIC_API_KEY` is absent. Produces scripted Counter/Form/Card demos across 4 steps; useful for UI development without API costs.
+| Abstraction | File | Purpose |
+|---|---|---|
+| `VirtualFileSystem` | `src/lib/file-system.ts` | In-memory `Map<string, FileNode>`; `serialize()` / `deserializeFromNodes()` for persistence |
+| `FileSystemContext` | `src/lib/contexts/file-system-context.tsx` | Owns VFS, exposes `handleToolCall()` |
+| `ChatContext` | `src/lib/contexts/chat-context.tsx` | Wraps `useChat`, injects VFS into requests, routes tool responses |
+| `str_replace_editor` | `src/lib/tools/str-replace.ts` | AI tool: `view`, `create`, `str_replace`, `insert` |
+| `file_manager` | `src/lib/tools/file-manager.ts` | AI tool: `rename`, `delete` |
+| Preview Pipeline | `src/lib/transform/jsx-transformer.ts` | Babel JSX transform + import map; entry point `/App.jsx` |
+| Auth | `src/lib/auth.ts` | JWT HS256, 7-day expiry, `httpOnly` cookie `auth-token` |
+| `MockLanguageModel` | `src/lib/provider.ts` | Scripted demos when `ANTHROPIC_API_KEY` absent |
 
 ### Pages
 
-- `/` — Redirects authenticated users to their most recent project (or creates one); shows empty `MainContent` for anonymous users
-- `/[projectId]` — Loads a project (auth required) and renders `MainContent`
-
-Both routes render the same `MainContent` split-pane layout: chat panel (left, resizable) + preview/code tabs (right).
-
-### Node Compatibility Shim
-
-`node-compat.cjs` is required via `NODE_OPTIONS` in all scripts. It deletes `globalThis.localStorage` and `globalThis.sessionStorage` on the server to prevent SSR crashes under Node.js 25+.
+- `/` — redirects authenticated users to most recent project (or creates one); shows empty state for anonymous
+- `/[projectId]` — loads project, renders `MainContent` split-pane (chat left, preview/code right)
 
 ## Testing
 
-Tests use Vitest + jsdom + Testing Library. Test files live alongside source in `__tests__/` subdirectories.
+Vitest + jsdom + Testing Library. Test files live in `__tests__/` alongside source.
 
 ```bash
-npx vitest run           # run once
-npx vitest               # watch mode
-npx vitest run --reporter=verbose
+npx vitest run --reporter=verbose  # verbose output
 ```
